@@ -47,6 +47,10 @@ DUMP_DIR = BASE_DIR / "dumps"
 IFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,255}$")
 MAX_FILTER_LEN = 512
+# Whitelist of characters allowed in a pcap/BPF filter. Covers the BPF grammar
+# (host/port/net/proto, ranges, arithmetic, logic) while rejecting quotes,
+# backticks, ';', '$' and other shell/markup metacharacters as defense in depth.
+FILTER_RE = re.compile(r"^[A-Za-z0-9 .,_:/()\[\]!=<>&|+*\-]*$")
 MAX_TEXT_RESPONSE = 1024 * 1024
 MAX_ITERATIONS = 1_000_000
 PBKDF2_CHALLENGE_RE = re.compile(
@@ -90,13 +94,26 @@ class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def build_opener(scheme, insecure_tls=False):
-    """urllib opener; HTTPS certificates are verified unless explicitly disabled."""
+def build_opener(scheme, insecure_tls=False, cacert=None):
+    """urllib opener; HTTPS certificates are verified unless explicitly disabled.
+
+    If ``cacert`` is given, it is used as the trust anchor instead of the system
+    store. This lets you pin the FRITZ!Box's own (self-signed) certificate and
+    keep verification on, so HTTPS protects against man-in-the-middle attacks
+    without falling back to ``--https-insecure``.
+    """
     handlers = [RestrictedRedirectHandler()]
     if scheme == "https":
-        ctx = ssl.create_default_context()
+        ctx = ssl.create_default_context(cafile=cacert) if cacert else ssl.create_default_context()
         if insecure_tls:
-            print("WARNING: HTTPS certificate verification is disabled!", file=sys.stderr)
+            print(
+                "WARNING: HTTPS certificate verification is DISABLED. The "
+                "connection is encrypted but NOT authenticated - anyone on your "
+                "LAN/Wi-Fi can impersonate the box (man-in-the-middle) and "
+                "capture the session and all recorded packets. Prefer pinning "
+                "the box certificate with --cacert / FRITZ_CACERT instead.",
+                file=sys.stderr,
+            )
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         handlers.append(urllib.request.HTTPSHandler(context=ctx))
@@ -127,8 +144,11 @@ def validate_capture_args(args):
     if args.snaplen:
         if not args.snaplen.isdigit() or not 64 <= int(args.snaplen) <= 262144:
             raise ValueError("Invalid snaplen. Use a number between 64 and 262144.")
-    if len(args.filter) > MAX_FILTER_LEN or any(ord(ch) < 32 for ch in args.filter):
-        raise ValueError("Invalid capture filter.")
+    if len(args.filter) > MAX_FILTER_LEN or not FILTER_RE.fullmatch(args.filter):
+        raise ValueError(
+            "Invalid capture filter. Allowed: letters, digits, spaces and "
+            ". , _ : / ( ) [ ] ! = < > & | + * -"
+        )
 
 
 def read_password_file(path_text):
@@ -348,7 +368,10 @@ def main():
                     help="use HTTPS instead of HTTP (or FRITZ_HTTPS=true in .env)")
     ap.add_argument("--https-insecure", action="store_true",
                     default=cfg_bool("FRITZ_HTTPS_INSECURE"),
-                    help="disable HTTPS certificate verification")
+                    help="disable HTTPS certificate verification (unsafe; prefer --cacert)")
+    ap.add_argument("--cacert", default=cfg("FRITZ_CACERT"),
+                    help="PEM file to verify the box's HTTPS cert against "
+                         "(pin a self-signed cert); or FRITZ_CACERT in .env")
     ap.add_argument("--user", default=cfg("FRITZ_USER"),
                     help="FRITZ!Box user (or dslf-config); else FRITZ_USER from .env")
     ap.add_argument("--password-file",
@@ -372,6 +395,20 @@ def main():
 
     scheme = "https" if args.https else "http"
     base = f"{scheme}://{args.host}"
+    if scheme == "http":
+        print(
+            "WARNING: using plain HTTP. Your session token and ALL captured "
+            "packets travel your LAN/Wi-Fi unencrypted and can be read by "
+            "anyone on the network. Use HTTPS (--https, ideally with --cacert).",
+            file=sys.stderr,
+        )
+    if args.cacert:
+        if args.https_insecure:
+            sys.exit("ERROR: use either --cacert or --https-insecure, not both.")
+        if not args.https:
+            sys.exit("ERROR: --cacert requires --https (or FRITZ_HTTPS=true).")
+        if not os.path.isfile(args.cacert):
+            sys.exit(f"ERROR: CA cert file not found: {args.cacert}")
     if args.password_file:
         try:
             password = read_password_file(args.password_file)
@@ -379,7 +416,7 @@ def main():
             sys.exit(f"ERROR: {exc}")
     else:
         password = cfg("FRITZ_PW") or getpass.getpass("FRITZ!Box password: ")
-    opener = build_opener(scheme, args.https_insecure)
+    opener = build_opener(scheme, args.https_insecure, args.cacert)
 
     challenge, blocktime = get_challenge(opener, base)
     if blocktime:

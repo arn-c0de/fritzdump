@@ -1,13 +1,24 @@
 # FritzDump
 
-Simple FRITZ!Box packet capture helper.
+Live packet capture from a FRITZ!Box.
 
-It logs in to the FRITZ!Box capture page and writes PCAP dumps for LAN,
-Wi-Fi 5 GHz, and Wi-Fi 2.4 GHz.
+FritzDump logs in to the hidden packet-capture page of a FRITZ!Box and streams
+the live traffic of an interface (LAN, Wi-Fi, or WAN) straight into Wireshark,
+ntopng, a `.pcap` file, or stdout — so you can watch and analyze the live
+connections of your own network in real time. No need to click through the
+web UI: it handles the login and starts the capture for you.
 
-Author: arn-c0de
+Supports both the old MD5 login and the current PBKDF2 login
+(FRITZ!OS 7.24+ / 8.x).
 
-License: MIT
+Author: arn-c0de · License: MIT
+
+## How it works
+
+1. Authenticates against `login_sid.lua` (MD5 or PBKDF2 challenge/response).
+2. Opens the box's internal `capture_notimeout` endpoint for the chosen
+   interface.
+3. Pipes the raw pcap stream live to your chosen target.
 
 ## Setup
 
@@ -16,62 +27,89 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env` and set your FRITZ!Box login:
+Edit `.env` with your FRITZ!Box login:
 
 ```bash
 FRITZ_HOST=192.168.178.1
 FRITZ_USER=fritz-capture-user
 FRITZ_PW=your-password
+FRITZ_HTTPS=true
+# Pin the box's self-signed cert so HTTPS is verified (recommended):
+# FRITZ_CACERT=fritzbox.pem
 ```
 
-Use a dedicated FRITZ!Box user with only the needed permissions.
+Tip: create a dedicated FRITZ!Box user that only has the
+**"FRITZ!Box settings"** permission. For password-only login (no user name),
+set `FRITZ_USER=dslf-config`.
 
 ## Usage
 
-List available interfaces:
+Check login and list the available interface IDs:
 
 ```bash
 ./run.sh test
 ```
 
-Start the default capture:
+Capture the default set (LAN + Wi-Fi 5 GHz + Wi-Fi 2.4 GHz) into `./dumps/`:
 
 ```bash
 ./run.sh
 ```
 
-Default captures:
+Stop with `Ctrl-C`.
 
-- LAN: `1-lan`
+### Other modes
+
+```bash
+./run.sh file 1-lan         # write one interface to a .pcap file
+./run.sh wireshark 1-lan    # stream live into Wireshark
+./run.sh ntopng 1-lan       # stream live into ntopng
+./run.sh raw 1-lan          # raw pcap to stdout (pipe into your own tool)
+```
+
+You can also call the Python tool directly:
+
+```bash
+./fritzdump.py --list                         # list interfaces
+./fritzdump.py --iface 2-1 --to wireshark     # WAN live into Wireshark
+./fritzdump.py --iface 1-0 --to capture.pcap  # write to a file
+./fritzdump.py --iface 2-1 --to - | your-tool # raw pcap to stdout
+./fritzdump.py --iface 2-1 --filter 'host 1.2.3.4'   # pcap filter
+```
+
+Interface IDs depend on your model/firmware — run `./run.sh test` to find them.
+The defaults below are what a FRITZ!Box 6591 reports:
+
+- LAN bridge: `1-lan`
 - Wi-Fi 5 GHz: `4-133`
 - Wi-Fi 2.4 GHz: `4-135`
-
-Stop with `Ctrl-C`.
+- WAN (example): `2-1`
 
 ## Dumps
 
-Dumps are written to:
+Captures are written to `./dumps/`. When a new default capture starts, old
+`dump_*` folders are removed first. The `dumps/` folder and all `*.pcap`,
+`*.pcapng`, and `*.eth` files are git-ignored.
 
-```text
-./dumps/
-```
+## Security notes
 
-Old dump folders are deleted when a new default capture starts.
+- Only capture traffic on networks you own or are explicitly authorized to inspect.
+- Never commit `.env` or any packet dumps.
+- **Use HTTPS.** Plain HTTP sends the session token and every captured packet
+  across your LAN/Wi-Fi in clear text; the tool prints a warning when you do.
+- The FRITZ!Box uses a self-signed certificate. Rather than disabling
+  verification, **pin it** so HTTPS stays authenticated and MITM-resistant:
 
-The `dumps/` folder and all `*.pcap`, `*.pcapng`, and `*.eth` files are ignored by Git.
+  ```bash
+  openssl s_client -connect 192.168.178.1:443 -showcerts </dev/null \
+    2>/dev/null | openssl x509 > fritzbox.pem
+  ./fritzdump.py --https --cacert fritzbox.pem --list   # or FRITZ_CACERT in .env
+  ```
 
-## Other Modes
-
-```bash
-./run.sh file 1-lan
-./run.sh wireshark 1-lan
-./run.sh ntopng 1-lan
-./run.sh raw 1-lan
-```
-
-## Security Notes
-
-- Do not commit `.env`.
-- Do not commit packet dumps.
-- Capture only networks you own or are allowed to inspect.
-- HTTPS certificate verification is enabled by default when HTTPS is used.
+- `--https-insecure` is a last resort: it leaves the link encrypted but
+  unauthenticated, so anyone on your network can impersonate the box. The tool
+  warns loudly and refuses to combine it with `--cacert`.
+- Capture filters (`--filter`) are restricted to a BPF character whitelist.
+- Pcap dumps contain your real traffic (including credentials from any
+  unencrypted sites). They are written `chmod 600` under `./dumps/` and are
+  git-ignored — delete them when you're done analyzing.
