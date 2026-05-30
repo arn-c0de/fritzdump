@@ -1,0 +1,16 @@
+# Never commit login data
+.env
+.env.*
+!.env.example
+
+# Captures
+dump_*/
+dumps/*
+!dumps/.gitignore
+*.pcap
+*.pcapng
+*.eth
+
+# Python
+__pycache__/
+*.pyc
