@@ -420,8 +420,13 @@ class PcapRedactor:
 
     def _redact(self, frame):
         """Return the leading header bytes of ``frame`` to keep (payload dropped)."""
-        if self._linktype != 1:  # only LINKTYPE_ETHERNET is parsed
-            return frame[:54]    # conservative fixed prefix (Eth+IPv4+TCP sized)
+        if self._linktype == 1:        # LINKTYPE_ETHERNET (wired bridge)
+            return self._redact_ethernet(frame)
+        if self._linktype == 105:      # LINKTYPE_IEEE802_11 (Wi-Fi interfaces)
+            return self._redact_dot11(frame)
+        return frame[:54]              # unknown link type: conservative fixed prefix
+
+    def _redact_ethernet(self, frame):
         n = len(frame)
         if n < 14:
             return frame
@@ -431,6 +436,43 @@ class PcapRedactor:
         while etype in (0x8100, 0x88A8, 0x9100) and n >= off + 4:
             etype = int.from_bytes(frame[off + 2:off + 4], "big")
             off += 4
+        return self._keep_from_l3(frame, off, etype, n)
+
+    def _redact_dot11(self, frame):
+        """Keep the 802.11 MAC header + LLC/SNAP + L3/L4 headers; drop payload.
+
+        The FRITZ!Box Wi-Fi capture streams raw 802.11 (Dot11/LLC/SNAP/IP). The
+        MAC header length is variable, so compute it from the frame-control field
+        before locating the SNAP-encapsulated EtherType and the IP header."""
+        n = len(frame)
+        if n < 24:
+            return frame
+        fc0, fc1 = frame[0], frame[1]
+        ftype = (fc0 >> 2) & 0x03
+        subtype = (fc0 >> 4) & 0x0F
+        # Only data frames (type 2) encapsulate an LLC/SNAP+IP payload. Management
+        # and control frames carry no IP to hide, so keep them verbatim.
+        if ftype != 2:
+            return frame
+        # Null-data frames (subtypes 4 and 12) have no payload at all.
+        if subtype in (4, 12):
+            return frame
+        hdr = 24
+        if (fc1 & 0x03) == 0x03:    # ToDS && FromDS -> 4-address header (+addr4)
+            hdr += 6
+        if subtype & 0x08:          # QoS data subtypes (8..15) carry a QoS control field
+            hdr += 2
+            if fc1 & 0x80:          # Order bit set on QoS data -> HT Control field
+                hdr += 4
+        # LLC/SNAP: aa-aa-03 OUI 00-00-00 then the encapsulated EtherType.
+        if n >= hdr + 8 and frame[hdr:hdr + 2] == b"\xaa\xaa":
+            etype = int.from_bytes(frame[hdr + 6:hdr + 8], "big")
+            return self._keep_from_l3(frame, hdr + 8, etype, n)
+        return frame[:hdr]          # no recognizable SNAP: keep only the MAC header
+
+    def _keep_from_l3(self, frame, off, etype, n):
+        """Given the L3 start offset and EtherType, return the bytes to keep
+        (through the end of the L4 header; payload dropped)."""
         if etype == 0x0800 and n >= off + 20:  # IPv4
             ihl = max((frame[off] & 0x0F) * 4, 20)
             return frame[:self._l4_keep(frame, off + ihl, frame[off + 9], n)]
