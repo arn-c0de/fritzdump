@@ -359,9 +359,15 @@ class PcapRedactor:
     until a full record is available.
     """
 
+    # global-header magic -> (struct endian prefix, per-record header length).
+    # The FRITZ!Box uses the "modified"/patched libpcap format (magic a1b2cd34),
+    # whose per-record header is 24 bytes (the standard 16 + ifindex/protocol/
+    # pkt_type/pad); the classic us/ns formats use a 16-byte record header. We
+    # must accept all of them, else redaction aborts on a real box stream.
     MAGIC = {
-        b"\xa1\xb2\xc3\xd4": ">", b"\xd4\xc3\xb2\xa1": "<",  # us-resolution
-        b"\xa1\xb2\x3c\x4d": ">", b"\x4d\x3c\xb2\xa1": "<",  # ns-resolution
+        b"\xa1\xb2\xc3\xd4": (">", 16), b"\xd4\xc3\xb2\xa1": ("<", 16),  # us-resolution
+        b"\xa1\xb2\x3c\x4d": (">", 16), b"\x4d\x3c\xb2\xa1": ("<", 16),  # ns-resolution
+        b"\xa1\xb2\xcd\x34": (">", 24), b"\x34\xcd\xb2\xa1": ("<", 24),  # modified
     }
 
     def __init__(self, write):
@@ -369,6 +375,7 @@ class PcapRedactor:
         self._buf = bytearray()
         self._endian = None
         self._rec = None
+        self._rec_hdr_len = None
         self._linktype = None
         self._header_done = False
 
@@ -378,31 +385,37 @@ class PcapRedactor:
             if len(self._buf) < 24:
                 return
             magic = bytes(self._buf[:4])
-            self._endian = self.MAGIC.get(magic)
-            if self._endian is None:
+            info = self.MAGIC.get(magic)
+            if info is None:
                 raise RuntimeError(
                     "Cannot redact: stream is not a recognized pcap (bad magic). "
                     "The box may be sending pcapng; capture without --redact."
                 )
+            self._endian, self._rec_hdr_len = info
             self._rec = struct.Struct(self._endian + "IIII")
             (self._linktype,) = struct.unpack(self._endian + "I", self._buf[20:24])
             self._write(bytes(self._buf[:24]))
             del self._buf[:24]
             self._header_done = True
 
-        while len(self._buf) >= 16:
+        hdr_len = self._rec_hdr_len
+        while len(self._buf) >= hdr_len:
             ts_sec, ts_usec, incl_len, orig_len = self._rec.unpack(self._buf[:16])
             if incl_len > MAX_CAPTURE_RECORD:
                 raise RuntimeError(
                     f"Cannot redact: implausible packet length ({incl_len} bytes); "
                     "stream is corrupt or out of sync."
                 )
-            if len(self._buf) < 16 + incl_len:
+            if len(self._buf) < hdr_len + incl_len:
                 return  # wait for the rest of this packet
-            frame = bytes(self._buf[16:16 + incl_len])
-            del self._buf[:16 + incl_len]
+            # The "modified" format carries 8 extra header bytes (ifindex etc.)
+            # after the standard 16; preserve them verbatim so the output stays a
+            # valid modified-pcap that the hub reads with a 24-byte record header.
+            extra = bytes(self._buf[16:hdr_len])
+            frame = bytes(self._buf[hdr_len:hdr_len + incl_len])
+            del self._buf[:hdr_len + incl_len]
             kept = self._redact(frame)
-            self._write(self._rec.pack(ts_sec, ts_usec, len(kept), orig_len))
+            self._write(self._rec.pack(ts_sec, ts_usec, len(kept), orig_len) + extra)
             self._write(kept)
 
     def _redact(self, frame):
