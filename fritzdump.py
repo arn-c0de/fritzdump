@@ -495,7 +495,13 @@ class PcapRedactor:
 
 
 def open_target(to):
-    """Return (write_fn, close_fn, proc) depending on the target."""
+    """Return (write_fn, flush_fn, close_fn, proc) depending on the target.
+
+    flush_fn must be called after every write so a *consumer* tailing the target
+    (e.g. the GDEF-L1NK hub reading the pcap off disk) sees each packet as it is
+    captured. Without it the file's userspace block buffer holds tens of seconds
+    of low-rate traffic and only spills to disk when full — which the reader sees
+    as long silences punctuated by sudden bursts."""
     # Isolate subprocess environment: only pass necessary PATH and TERM
     clean_env = {"PATH": os.environ.get("PATH", ""), "TERM": os.environ.get("TERM", "dumb")}
 
@@ -503,24 +509,24 @@ def open_target(to):
         wireshark = shutil.which("wireshark")
         if not wireshark:
             raise RuntimeError("wireshark not found in PATH.")
-        proc = subprocess.Popen([wireshark, "-k", "-i", "-"], 
+        proc = subprocess.Popen([wireshark, "-k", "-i", "-"],
                                 stdin=subprocess.PIPE, env=clean_env)
-        return proc.stdin.write, proc.stdin.close, proc
+        return proc.stdin.write, proc.stdin.flush, proc.stdin.close, proc
     if to == "ntopng":
         ntopng = shutil.which("ntopng")
         if not ntopng:
             raise RuntimeError("ntopng not found in PATH.")
-        proc = subprocess.Popen([ntopng, "-i", "-"], 
+        proc = subprocess.Popen([ntopng, "-i", "-"],
                                 stdin=subprocess.PIPE, env=clean_env)
-        return proc.stdin.write, proc.stdin.close, proc
+        return proc.stdin.write, proc.stdin.flush, proc.stdin.close, proc
     if to in ("-", "stdout"):
-        return sys.stdout.buffer.write, lambda: None, None
+        return sys.stdout.buffer.write, sys.stdout.buffer.flush, lambda: None, None
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(safe_capture_path(to), flags, 0o600)
     f = os.fdopen(fd, "wb")
-    return f.write, f.close, None
+    return f.write, f.flush, f.close, None
 
 def main():
     dotenv = load_dotenv()
@@ -622,7 +628,7 @@ def main():
     cap_url = f"{base}/cgi-bin/capture_notimeout?{q}"
     stop_url = f"{base}/cgi-bin/capture_notimeout?capture=Stop&sid={sid}&ifaceorminor={args.iface}"
 
-    write, close, proc = open_target(args.to)
+    write, flush, close, proc = open_target(args.to)
     if args.redact:
         write = PcapRedactor(write).feed
         print("[*] Redaction ON: payloads stripped; only packet headers "
@@ -642,12 +648,15 @@ def main():
     try:
         resp = http_get(opener, cap_url, binary=True, timeout=None)
         while not shutdown_requested:
-            chunk = resp.read(65536)
+            # read1() hands back whatever one socket/chunk read yields instead of
+            # blocking until a full 65 KB has accumulated — on a low-rate link that
+            # accumulation is exactly what made the capture arrive in bursts. Pair
+            # it with flush() so each packet reaches the target the moment it lands.
+            chunk = resp.read1(65536)
             if not chunk:
                 break
             write(chunk)
-            if args.to in ("-", "stdout"):
-                sys.stdout.buffer.flush()
+            flush()
     except BrokenPipeError:
         pass
     except Exception as exc:  # noqa: BLE001
