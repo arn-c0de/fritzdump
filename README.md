@@ -34,8 +34,9 @@ FRITZ_HOST=192.168.178.1
 FRITZ_USER=fritz-capture-user
 FRITZ_PW=your-password
 FRITZ_HTTPS=true
-# Pin the box's self-signed cert so HTTPS is verified (recommended):
-# FRITZ_CACERT=fritzbox.pem
+# The login API answers only on the box's LAN IP, whose self-signed cert has no
+# IP SAN -> verification can't pass there, so on a trusted LAN use:
+# FRITZ_HTTPS_INSECURE=true   (encrypted, not authenticated; see Security below)
 ```
 
 Tip: create a dedicated FRITZ!Box user that only has the
@@ -116,18 +117,31 @@ Captures are written to `./dumps/`. When a new default capture starts, old
 - Never commit `.env` or any packet dumps.
 - **Use HTTPS.** Plain HTTP sends the session token and every captured packet
   across your LAN/Wi-Fi in clear text; the tool prints a warning when you do.
-- The FRITZ!Box uses a self-signed certificate. Rather than disabling
-  verification, **pin it** so HTTPS stays authenticated and MITM-resistant:
+- **TLS verification, first-run gotcha.** The login API (`login_sid.lua`)
+  answers only on the box's **LAN IPv4** — the `fritz.box` hostname
+  (IPv6/MyFRITZ) returns no login challenge. On that LAN IP the box presents a
+  **self-signed certificate with no IP SAN**, so HTTPS verification + hostname
+  check can never pass and `--cacert` does **not** help (the hostname check
+  still fails on a bare IP). With `--https` and verification on you therefore
+  get `CERTIFICATE_VERIFY_FAILED` and the capture won't start. Your options:
+
+  - **Trusted wired LAN (usual choice):** `--https-insecure` (or
+    `FRITZ_HTTPS_INSECURE=true`). The link stays **encrypted** (credentials and
+    packets are never in clear text) but is **not authenticated**, so an active
+    MITM on the LAN could impersonate the box. Still strictly better than plain
+    HTTP. The tool warns loudly and refuses to combine it with `--cacert`.
+  - **Pin + verify** only works if you reach the box by a hostname that **is in
+    the cert SAN** (e.g. `fritz.box`) *and* resolves to it on the LAN; then set
+    that name as `FRITZ_HOST`, point `--cacert`/`FRITZ_CACERT` at the box PEM,
+    and keep verification on. Note the box may serve a publicly-trusted
+    (Let's Encrypt) cert on its hostname, in which case no pinning is needed —
+    but that cert rotates, so don't pin its leaf.
 
   ```bash
+  # export the cert presented on the LAN IP (for the pin+verify case):
   openssl s_client -connect 192.168.178.1:443 -showcerts </dev/null \
     2>/dev/null | openssl x509 > fritzbox.pem
-  ./fritzdump.py --https --cacert fritzbox.pem --list   # or FRITZ_CACERT in .env
   ```
-
-- `--https-insecure` is a last resort: it leaves the link encrypted but
-  unauthenticated, so anyone on your network can impersonate the box. The tool
-  warns loudly and refuses to combine it with `--cacert`.
 - Capture filters (`--filter`) are restricted to a BPF character whitelist.
 - The current PBKDF2 login is always used when the box offers it. The old
   pre-7.24 **MD5 login is weak and is refused by default** to stop a forced
