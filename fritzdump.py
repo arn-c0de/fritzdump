@@ -35,6 +35,7 @@ import signal
 import shutil
 import ssl
 import stat
+import struct
 import subprocess
 import sys
 import urllib.error
@@ -53,6 +54,10 @@ MAX_FILTER_LEN = 512
 FILTER_RE = re.compile(r"^[A-Za-z0-9 .,_:/()\[\]!=<>&|+*\-]*$")
 MAX_TEXT_RESPONSE = 1024 * 1024
 MAX_ITERATIONS = 1_000_000
+# Largest packet record we accept while redacting. Matches the box's snaplen
+# ceiling; anything bigger means a desynced/corrupt stream, so we abort rather
+# than buffer unbounded data.
+MAX_CAPTURE_RECORD = 262144
 PBKDF2_CHALLENGE_RE = re.compile(
     r"^2\$(?P<iter1>[0-9]{1,7})\$(?P<salt1>[0-9a-fA-F]{16,128})"
     r"\$(?P<iter2>[0-9]{1,7})\$(?P<salt2>[0-9a-fA-F]{16,128})$"
@@ -320,6 +325,102 @@ def list_interfaces(opener, base, sid):
         print(f"{iid:<14}...{label}")
 
 
+class PcapRedactor:
+    """Streaming pcap filter that strips packet payloads but keeps the headers.
+
+    The FRITZ!Box streams a normal pcap (global header + per-packet records).
+    When redaction is enabled we parse that stream on the fly and truncate every
+    frame to the end of its L2-L4 headers: Ethernet (MAC addresses), IPv4/IPv6
+    (IP addresses, protocol), and TCP/UDP/ICMP (ports, flags) are preserved, the
+    application payload is dropped. Each record keeps its original ``orig_len``,
+    so you still see how big a message was and between whom it flowed -- but not
+    what was inside. To downstream tools this looks exactly like a capture taken
+    with a small snaplen (Wireshark shows "[Packet size limited during capture]").
+
+    Chunks from the box do not align with packet boundaries, so input is buffered
+    until a full record is available.
+    """
+
+    MAGIC = {
+        b"\xa1\xb2\xc3\xd4": ">", b"\xd4\xc3\xb2\xa1": "<",  # us-resolution
+        b"\xa1\xb2\x3c\x4d": ">", b"\x4d\x3c\xb2\xa1": "<",  # ns-resolution
+    }
+
+    def __init__(self, write):
+        self._write = write
+        self._buf = bytearray()
+        self._endian = None
+        self._rec = None
+        self._linktype = None
+        self._header_done = False
+
+    def feed(self, chunk):
+        self._buf += chunk
+        if not self._header_done:
+            if len(self._buf) < 24:
+                return
+            magic = bytes(self._buf[:4])
+            self._endian = self.MAGIC.get(magic)
+            if self._endian is None:
+                raise RuntimeError(
+                    "Cannot redact: stream is not a recognized pcap (bad magic). "
+                    "The box may be sending pcapng; capture without --redact."
+                )
+            self._rec = struct.Struct(self._endian + "IIII")
+            (self._linktype,) = struct.unpack(self._endian + "I", self._buf[20:24])
+            self._write(bytes(self._buf[:24]))
+            del self._buf[:24]
+            self._header_done = True
+
+        while len(self._buf) >= 16:
+            ts_sec, ts_usec, incl_len, orig_len = self._rec.unpack(self._buf[:16])
+            if incl_len > MAX_CAPTURE_RECORD:
+                raise RuntimeError(
+                    f"Cannot redact: implausible packet length ({incl_len} bytes); "
+                    "stream is corrupt or out of sync."
+                )
+            if len(self._buf) < 16 + incl_len:
+                return  # wait for the rest of this packet
+            frame = bytes(self._buf[16:16 + incl_len])
+            del self._buf[:16 + incl_len]
+            kept = self._redact(frame)
+            self._write(self._rec.pack(ts_sec, ts_usec, len(kept), orig_len))
+            self._write(kept)
+
+    def _redact(self, frame):
+        """Return the leading header bytes of ``frame`` to keep (payload dropped)."""
+        if self._linktype != 1:  # only LINKTYPE_ETHERNET is parsed
+            return frame[:54]    # conservative fixed prefix (Eth+IPv4+TCP sized)
+        n = len(frame)
+        if n < 14:
+            return frame
+        etype = int.from_bytes(frame[12:14], "big")
+        off = 14
+        # Walk one or more VLAN tags (802.1Q / QinQ).
+        while etype in (0x8100, 0x88A8, 0x9100) and n >= off + 4:
+            etype = int.from_bytes(frame[off + 2:off + 4], "big")
+            off += 4
+        if etype == 0x0800 and n >= off + 20:  # IPv4
+            ihl = max((frame[off] & 0x0F) * 4, 20)
+            return frame[:self._l4_keep(frame, off + ihl, frame[off + 9], n)]
+        if etype == 0x86DD and n >= off + 40:  # IPv6 (no extension-header walk)
+            return frame[:self._l4_keep(frame, off + 40, frame[off + 6], n)]
+        # ARP and other small control frames carry no payload to hide: keep them.
+        if n <= 64:
+            return frame
+        return frame[:off]  # unknown large frame: keep only the L2 header
+
+    @staticmethod
+    def _l4_keep(frame, ip_end, proto, n):
+        """End offset to keep for a given L4 protocol (header only, no payload)."""
+        if proto == 6 and n >= ip_end + 20:  # TCP: data offset gives header length
+            doff = max((frame[ip_end + 12] >> 4) * 4, 20)
+            return min(ip_end + doff, n)
+        if proto in (17, 1, 58):  # UDP / ICMPv4 / ICMPv6: 8-byte header
+            return min(ip_end + 8, n)
+        return min(ip_end, n)  # other protocols: keep the IP header only
+
+
 def open_target(to):
     """Return (write_fn, close_fn, proc) depending on the target."""
     # Isolate subprocess environment: only pass necessary PATH and TERM
@@ -382,6 +483,10 @@ def main():
     ap.add_argument("--to", default="-",
                     help="target: wireshark | ntopng | <file.pcap> | - (stdout)")
     ap.add_argument("--list", action="store_true", help="only list interfaces")
+    ap.add_argument("--redact", action="store_true",
+                    default=cfg_bool("FRITZ_REDACT"),
+                    help="strip packet payloads, keep only headers (who/where/"
+                         "size, not content); or FRITZ_REDACT=true in .env")
     args = ap.parse_args()
 
     if not args.user:
@@ -440,6 +545,10 @@ def main():
     stop_url = f"{base}/cgi-bin/capture_notimeout?capture=Stop&sid={sid}&ifaceorminor={args.iface}"
 
     write, close, proc = open_target(args.to)
+    if args.redact:
+        write = PcapRedactor(write).feed
+        print("[*] Redaction ON: payloads stripped; only packet headers "
+              "(addresses, ports, sizes) are recorded.", file=sys.stderr)
     shutdown_requested = False
     capture_error = None
 

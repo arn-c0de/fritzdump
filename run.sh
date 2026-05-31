@@ -9,6 +9,9 @@
 #   ./run.sh file 2-1        Write to dump_<date>.pcap
 #   ./run.sh raw 2-1         Raw pcap to stdout (e.g. | your SIEM tool)
 #   ./run.sh home            Capture LAN + Wi-Fi 5 GHz + Wi-Fi 2.4 GHz
+#
+# Set FRITZ_REDACT=true (in .env or the environment) to strip packet payloads
+# and record only headers (addresses, ports, sizes) -- no message contents.
 
 set -euo pipefail
 cd "$(dirname "$0")"

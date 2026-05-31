@@ -75,6 +75,25 @@ You can also call the Python tool directly:
 ./fritzdump.py --iface 1-0 --to capture.pcap  # write to a file
 ./fritzdump.py --iface 2-1 --to - | your-tool # raw pcap to stdout
 ./fritzdump.py --iface 2-1 --filter 'host 1.2.3.4'   # pcap filter
+./fritzdump.py --iface 2-1 --to cap.pcap --redact    # headers only, no payload
+```
+
+### Redacted capture (metadata only)
+
+Pass `--redact` (or set `FRITZ_REDACT=true` in `.env`) to record traffic
+**without storing packet contents**. Each frame is truncated to its L2–L4
+headers: Ethernet (MAC addresses), IPv4/IPv6 (IP addresses, protocol) and
+TCP/UDP/ICMP (ports, flags) are kept, the application payload is dropped. The
+original frame length is preserved in the record, so you still see **how long**
+a message was and **between whom** it flowed — just not what was inside.
+
+The output is still a valid pcap and opens normally in Wireshark/ntopng (it
+shows `[Packet size limited during capture]` for the stripped payloads). Works
+for every target (`--to wireshark | ntopng | file | -`).
+
+```bash
+./run.sh file 1-lan     # full capture (default)
+FRITZ_REDACT=true ./run.sh file 1-lan   # redacted: headers only
 ```
 
 Interface IDs depend on your model/firmware — run `./run.sh test` to find them.
@@ -112,4 +131,6 @@ Captures are written to `./dumps/`. When a new default capture starts, old
 - Capture filters (`--filter`) are restricted to a BPF character whitelist.
 - Pcap dumps contain your real traffic (including credentials from any
   unencrypted sites). They are written `chmod 600` under `./dumps/` and are
-  git-ignored — delete them when you're done analyzing.
+  git-ignored — delete them when you're done analyzing. If you only need
+  traffic metadata (who talks to whom, message sizes), use `--redact` /
+  `FRITZ_REDACT=true` so payloads are never written to disk.
