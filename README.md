@@ -129,6 +129,10 @@ Captures are written to `./dumps/`. When a new default capture starts, old
   unauthenticated, so anyone on your network can impersonate the box. The tool
   warns loudly and refuses to combine it with `--cacert`.
 - Capture filters (`--filter`) are restricted to a BPF character whitelist.
+- The current PBKDF2 login is always used when the box offers it. The old
+  pre-7.24 **MD5 login is weak and is refused by default** to stop a forced
+  downgrade; enable it only for genuinely old firmware with
+  `--allow-legacy-login` / `FRITZ_ALLOW_LEGACY=true`, ideally over HTTPS.
 - Pcap dumps contain your real traffic (including credentials from any
   unencrypted sites). They are written `chmod 600` under `./dumps/` and are
   git-ignored — delete them when you're done analyzing. If you only need

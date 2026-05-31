@@ -216,8 +216,15 @@ def get_challenge(opener, base):
     return challenge.group(1), int(blocktime.group(1)) if blocktime else 0
 
 
-def solve_challenge(challenge, password):
-    """Compute the login response. PBKDF2 for new, MD5 for old firmware."""
+def solve_challenge(challenge, password, allow_legacy=False):
+    """Compute the login response. PBKDF2 for new, MD5 for old firmware.
+
+    Modern FRITZ!OS (7.24+) sends a ``2$...`` PBKDF2 challenge and that path is
+    always used. Pre-7.24 firmware uses an MD5 challenge-response, which is the
+    only scheme those boxes accept. Because a downgrade to the weaker MD5 scheme
+    could be forced by a man-in-the-middle on a plain-HTTP link, the legacy path
+    is refused unless ``allow_legacy`` is explicitly set.
+    """
     if challenge.startswith("2$"):
         # Format: 2$<iter1>$<salt1>$<iter2>$<salt2>
         m = PBKDF2_CHALLENGE_RE.match(challenge)
@@ -230,11 +237,22 @@ def solve_challenge(challenge, password):
         hash1 = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt1, it1)
         hash2 = hashlib.pbkdf2_hmac("sha256", hash1, salt2, it2)
         return f"{m.group('salt2')}${hash2.hex()}"
-    # Old: MD5 over (challenge + "-" + password) in UTF-16LE
+    if not allow_legacy:
+        raise RuntimeError(
+            "Box offered the legacy MD5 login (pre-FRITZ!OS 7.24). This weaker "
+            "scheme is refused by default to prevent a forced downgrade. If your "
+            "box genuinely runs old firmware, re-run with --allow-legacy-login "
+            "(or FRITZ_ALLOW_LEGACY=true) and prefer HTTPS so the exchange can't "
+            "be observed."
+        )
+    # Legacy: MD5 over (challenge + "-" + password) in UTF-16LE. The algorithm is
+    # mandated by the old FRITZ!Box protocol (the box computes the same MD5 and
+    # compares); it is not a password-at-rest hash and cannot be strengthened
+    # without breaking login on that firmware. Gated behind --allow-legacy-login.
     if not OLD_CHALLENGE_RE.fullmatch(challenge):
         raise RuntimeError("Invalid MD5 challenge format.")
     raw = f"{challenge}-{password}".encode("utf-16-le")
-    return f"{challenge}-{hashlib.md5(raw).hexdigest()}"
+    return f"{challenge}-{hashlib.md5(raw).hexdigest()}"  # noqa: S324 - legacy protocol
 
 
 def get_sid(opener, base, user, response):
@@ -487,6 +505,10 @@ def main():
                     default=cfg_bool("FRITZ_REDACT"),
                     help="strip packet payloads, keep only headers (who/where/"
                          "size, not content); or FRITZ_REDACT=true in .env")
+    ap.add_argument("--allow-legacy-login", action="store_true",
+                    default=cfg_bool("FRITZ_ALLOW_LEGACY"),
+                    help="permit the weak pre-7.24 MD5 login (refused by default "
+                         "to block downgrades); or FRITZ_ALLOW_LEGACY=true in .env")
     args = ap.parse_args()
 
     if not args.user:
@@ -527,7 +549,8 @@ def main():
     if blocktime:
         print(f"Note: box reports BlockTime {blocktime}s (too many failed logins).",
               file=sys.stderr)
-    sid = get_sid(opener, base, args.user, solve_challenge(challenge, password))
+    sid = get_sid(opener, base, args.user,
+                  solve_challenge(challenge, password, args.allow_legacy_login))
     print("Login ok.", file=sys.stderr)
 
     if args.list:
