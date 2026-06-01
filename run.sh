@@ -68,10 +68,23 @@ capture_group() {
   outdir="$(mktemp -d -p "$DUMP_ROOT" "dump_${stamp}_XXXXXX")"
   chmod go-rwx "$outdir"
 
-  # Interface IDs as listed by current FRITZ!OS capture page on this box:
-  # 1-lan = LAN bridge, 4-133 = AP 5 GHz, 4-135 = AP2 2.4 GHz.
-  local -a names=("lan" "wifi_5ghz" "wifi_24ghz")
-  local -a ifaces=("1-lan" "4-133" "4-135")
+  # Interface IDs as listed by the FRITZ!OS capture page (run `./run.sh test`).
+  # They vary by box/firmware, so the whole set is overridable via the
+  # FRITZ_HOME_IFACES env var: a space-separated list of name:iface pairs, e.g.
+  #   FRITZ_HOME_IFACES="lan:1-lan wifi_5ghz:4-133 wifi_24ghz:1-ath0"
+  #
+  # Defaults for this box: 1-lan = LAN bridge, 4-133 = AP 5 GHz (ath1). For
+  # 2.4 GHz we use the RAW radio interface 1-ath0, NOT the logical AP 4-135:
+  # on this firmware 4-135 accepts the capture but streams ZERO packets, while
+  # the actual 2.4 GHz client traffic (e.g. phones that only roam onto 2.4 GHz)
+  # shows up on 1-ath0. Capturing 4-135 silently lost every 2.4 GHz-only device.
+  local -a names=() ifaces=()
+  local _pairs="${FRITZ_HOME_IFACES:-lan:1-lan wifi_5ghz:4-133 wifi_24ghz:1-ath0}"
+  local _p
+  for _p in $_pairs; do
+    names+=("${_p%%:*}")
+    ifaces+=("${_p#*:}")
+  done
   local -a pids=()
 
   echo "[*] Capturing LAN + Wi-Fi 5 GHz + Wi-Fi 2.4 GHz into $outdir/"
