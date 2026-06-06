@@ -355,19 +355,32 @@ class PcapRedactor:
     what was inside. To downstream tools this looks exactly like a capture taken
     with a small snaplen (Wireshark shows "[Packet size limited during capture]").
 
+    The box emits the "modified"/patched libpcap format (magic a1b2cd34, 24-byte
+    record headers). Many readers reject that magic -- notably scapy, which the
+    GDEF pipeline uses, raises "Not a supported capture file". So we NORMALIZE the
+    output to a standard us-resolution pcap: the modified magic is rewritten to
+    its standard equivalent and the 8 extra per-record bytes (ifindex/pkt_type/
+    pad, unused for flow accounting) are dropped. Standard input magics pass
+    through unchanged (rewriting an ns magic to us would mislabel timestamps).
+
     Chunks from the box do not align with packet boundaries, so input is buffered
     until a full record is available.
     """
 
     # global-header magic -> (struct endian prefix, per-record header length).
-    # The FRITZ!Box uses the "modified"/patched libpcap format (magic a1b2cd34),
-    # whose per-record header is 24 bytes (the standard 16 + ifindex/protocol/
-    # pkt_type/pad); the classic us/ns formats use a 16-byte record header. We
-    # must accept all of them, else redaction aborts on a real box stream.
+    # The classic us/ns formats use a 16-byte record header; the FRITZ!Box's
+    # "modified" format (a1b2cd34) uses 24 (the standard 16 + ifindex/protocol/
+    # pkt_type/pad). We accept all of them, else redaction aborts on a box stream.
     MAGIC = {
         b"\xa1\xb2\xc3\xd4": (">", 16), b"\xd4\xc3\xb2\xa1": ("<", 16),  # us-resolution
         b"\xa1\xb2\x3c\x4d": (">", 16), b"\x4d\x3c\xb2\xa1": ("<", 16),  # ns-resolution
         b"\xa1\xb2\xcd\x34": (">", 24), b"\x34\xcd\xb2\xa1": ("<", 24),  # modified
+    }
+    # Modified magic -> equivalent standard us magic, written on output so common
+    # readers (scapy, tshark) accept the redacted stream. Standard magics are not
+    # listed: they are emitted verbatim to keep their us/ns resolution intact.
+    NORMALIZE = {
+        b"\xa1\xb2\xcd\x34": b"\xa1\xb2\xc3\xd4", b"\x34\xcd\xb2\xa1": b"\xd4\xc3\xb2\xa1",
     }
 
     def __init__(self, write):
@@ -394,7 +407,9 @@ class PcapRedactor:
             self._endian, self._rec_hdr_len = info
             self._rec = struct.Struct(self._endian + "IIII")
             (self._linktype,) = struct.unpack(self._endian + "I", self._buf[20:24])
-            self._write(bytes(self._buf[:24]))
+            # Rewrite a "modified" magic to its standard equivalent (see NORMALIZE);
+            # the rest of the 24-byte global header is identical across formats.
+            self._write(self.NORMALIZE.get(magic, magic) + bytes(self._buf[4:24]))
             del self._buf[:24]
             self._header_done = True
 
@@ -408,14 +423,13 @@ class PcapRedactor:
                 )
             if len(self._buf) < hdr_len + incl_len:
                 return  # wait for the rest of this packet
-            # The "modified" format carries 8 extra header bytes (ifindex etc.)
-            # after the standard 16; preserve them verbatim so the output stays a
-            # valid modified-pcap that the hub reads with a 24-byte record header.
-            extra = bytes(self._buf[16:hdr_len])
+            # Drop the "modified" format's 8 extra header bytes (ifindex etc.) so
+            # the output is a standard 16-byte-record pcap; for standard input
+            # hdr_len is already 16 and there is nothing extra to drop.
             frame = bytes(self._buf[hdr_len:hdr_len + incl_len])
             del self._buf[:hdr_len + incl_len]
             kept = self._redact(frame)
-            self._write(self._rec.pack(ts_sec, ts_usec, len(kept), orig_len) + extra)
+            self._write(self._rec.pack(ts_sec, ts_usec, len(kept), orig_len))
             self._write(kept)
 
     def _redact(self, frame):
