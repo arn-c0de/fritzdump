@@ -437,26 +437,35 @@ class PcapRedactor:
         self._header_done = False
 
     def feed(self, chunk):
+        """Absorb a stream chunk and emit every complete, redacted record it completes."""
         self._buf += chunk
-        if not self._header_done:
-            if len(self._buf) < 24:
-                return
-            magic = bytes(self._buf[:4])
-            info = self.MAGIC.get(magic)
-            if info is None:
-                raise RuntimeError(
-                    "Cannot redact: stream is not a recognized pcap (bad magic). "
-                    "The box may be sending pcapng; capture without --redact."
-                )
-            self._endian, self._rec_hdr_len = info
-            self._rec = struct.Struct(self._endian + "IIII")
-            (self._linktype,) = struct.unpack(self._endian + "I", self._buf[20:24])
-            # Rewrite a "modified" magic to its standard equivalent (see NORMALIZE);
-            # the rest of the 24-byte global header is identical across formats.
-            self._write(self.NORMALIZE.get(magic, magic) + bytes(self._buf[4:24]))
-            del self._buf[:24]
-            self._header_done = True
+        if not self._header_done and not self._consume_global_header():
+            return  # global header not fully buffered yet
+        self._emit_ready_records()
 
+    def _consume_global_header(self) -> bool:
+        """Parse and re-emit the 24-byte global header. Returns True once done."""
+        if len(self._buf) < 24:
+            return False
+        magic = bytes(self._buf[:4])
+        info = self.MAGIC.get(magic)
+        if info is None:
+            raise RuntimeError(
+                "Cannot redact: stream is not a recognized pcap (bad magic). "
+                "The box may be sending pcapng; capture without --redact."
+            )
+        self._endian, self._rec_hdr_len = info
+        self._rec = struct.Struct(self._endian + "IIII")
+        (self._linktype,) = struct.unpack(self._endian + "I", self._buf[20:24])
+        # Rewrite a "modified" magic to its standard equivalent (see NORMALIZE);
+        # the rest of the 24-byte global header is identical across formats.
+        self._write(self.NORMALIZE.get(magic, magic) + bytes(self._buf[4:24]))
+        del self._buf[:24]
+        self._header_done = True
+        return True
+
+    def _emit_ready_records(self) -> None:
+        """Redact and write out each record that is fully present in the buffer."""
         hdr_len = self._rec_hdr_len
         while len(self._buf) >= hdr_len:
             ts_sec, ts_usec, incl_len, orig_len = self._rec.unpack(self._buf[:16])
