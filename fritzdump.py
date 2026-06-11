@@ -297,43 +297,36 @@ def sanitize_terminal(text: str) -> str:
     return "".join(ch for ch in text if ch.isprintable())
 
 
-def list_interfaces(opener, base: str, sid: str) -> None:
-    """Parse the capture page response for interface IDs."""
-    data = urllib.parse.urlencode({"sid": sid, "page": "cap", "lang": "en"}).encode()
-    req = urllib.request.Request(f"{base}/data.lua", data=data,
-                                 headers={"User-Agent": "fritzcap/1.0"})
-    raw = read_limited_text(opener.open(req, timeout=10))
+def _clean_label(text: str) -> str:
+    """Strip HTML tags from an interface label and collapse its whitespace."""
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", html_lib.unescape(text)).strip()
 
-    seen, rows = set(), []
 
-    def clean_label(text):
-        text = re.sub(r"<[^>]+>", " ", text)
-        return re.sub(r"\s+", " ", html_lib.unescape(text)).strip()
-
+def _interfaces_from_json(raw: str):
+    """Yield (id, label) pairs from the data.lua JSON snapshot (best source)."""
     try:
         payload = json.loads(raw)
-        interfaces = payload.get("data", {}).get("snapshot", {}).get("interfaces", [])
     except json.JSONDecodeError:
-        interfaces = []
-
+        return
+    interfaces = payload.get("data", {}).get("snapshot", {}).get("interfaces", [])
     for item in interfaces:
         if not isinstance(item, dict):
             continue
         iid = item.get("name") or item.get("id") or item.get("ifaceorminor")
-        if not iid or iid in seen:
+        if not iid:
             continue
-        seen.add(iid)
-        label_parts = [
-            item.get("kind"),
-            item.get("ifacename"),
-            item.get("displayname"),
-            item.get("description"),
-        ]
-        label = " ".join(str(part) for part in label_parts if part)
-        rows.append((iid, label))
+        label = " ".join(str(part) for part in (
+            item.get("kind"), item.get("ifacename"),
+            item.get("displayname"), item.get("description"),
+        ) if part)
+        yield iid, label
 
-    for m in re.finditer(r"<tr\b.*?</tr>", raw, flags=re.IGNORECASE | re.DOTALL):
-        tr = m.group(0)
+
+def _interfaces_from_buttons(raw: str):
+    """Yield (id, label) pairs from the HTML capture table's Start buttons."""
+    for row in re.finditer(r"<tr\b.*?</tr>", raw, flags=re.IGNORECASE | re.DOTALL):
+        tr = row.group(0)
         btn = re.search(
             r"<button\b(?=[^>]*\bname=[\"']start[\"'])(?=[^>]*\bvalue=[\"']([^\"']+)[\"'])",
             tr,
@@ -341,20 +334,37 @@ def list_interfaces(opener, base: str, sid: str) -> None:
         )
         if not btn:
             continue
-        iid = html_lib.unescape(btn.group(1))
-        if iid in seen:
-            continue
-        seen.add(iid)
         th = re.search(r"<th\b[^>]*>(.*?)</th>", tr, flags=re.IGNORECASE | re.DOTALL)
-        rows.append((iid, clean_label(th.group(1)) if th else ""))
+        yield html_lib.unescape(btn.group(1)), _clean_label(th.group(1)) if th else ""
 
+
+def _interfaces_from_urls(raw: str):
+    """Yield (id, label) pairs from leftover ifaceorminor=... links (last resort)."""
     for m in re.finditer(r"ifaceorminor=([^&\"'\s>]+)", raw):
-        iid = m.group(1)
-        if iid in seen:
-            continue
-        seen.add(iid)
-        label = clean_label(raw[max(0, m.start() - 220):m.start()])[-55:]
-        rows.append((iid, label))
+        label = _clean_label(raw[max(0, m.start() - 220):m.start()])[-55:]
+        yield m.group(1), label
+
+
+def list_interfaces(opener, base: str, sid: str) -> None:
+    """Fetch the capture page and print the interface IDs it advertises.
+
+    FRITZ!OS versions render this page differently, so three sources are tried
+    in order of reliability: the JSON snapshot, the HTML Start buttons, and any
+    remaining ifaceorminor=... links. The first occurrence of an ID wins; later
+    duplicates from another source are ignored.
+    """
+    data = urllib.parse.urlencode({"sid": sid, "page": "cap", "lang": "en"}).encode()
+    req = urllib.request.Request(f"{base}/data.lua", data=data,
+                                 headers={"User-Agent": "fritzcap/1.0"})
+    raw = read_limited_text(opener.open(req, timeout=10))
+
+    seen, rows = set(), []
+    for source in (_interfaces_from_json, _interfaces_from_buttons, _interfaces_from_urls):
+        for iid, label in source(raw):
+            if iid in seen:
+                continue
+            seen.add(iid)
+            rows.append((iid, label))
 
     if not rows:
         print("No interface IDs found. Open the capture page in a browser and "
@@ -363,8 +373,7 @@ def list_interfaces(opener, base: str, sid: str) -> None:
     print(f"{'ID (--iface)':<14}description (hint)")
     print("-" * 60)
     for iid, label in rows:
-        label = sanitize_terminal(label)
-        print(f"{iid:<14}...{label}")
+        print(f"{iid:<14}...{sanitize_terminal(label)}")
 
 
 class PcapRedactor:
