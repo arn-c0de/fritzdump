@@ -250,17 +250,7 @@ def solve_challenge(challenge: str, password: str, allow_legacy: bool = False) -
     is refused unless ``allow_legacy`` is explicitly set.
     """
     if challenge.startswith("2$"):
-        # Format: 2$<iter1>$<salt1>$<iter2>$<salt2>
-        m = PBKDF2_CHALLENGE_RE.match(challenge)
-        if not m:
-            raise RuntimeError("Invalid PBKDF2 challenge format.")
-        it1, it2 = int(m.group("iter1")), int(m.group("iter2"))
-        if it1 > MAX_ITERATIONS or it2 > MAX_ITERATIONS:
-            raise RuntimeError(f"PBKDF2 iterations too high ({it1}/{it2}).")
-        salt1, salt2 = bytes.fromhex(m.group("salt1")), bytes.fromhex(m.group("salt2"))
-        hash1 = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt1, it1)
-        hash2 = hashlib.pbkdf2_hmac("sha256", hash1, salt2, it2)
-        return f"{m.group('salt2')}${hash2.hex()}"
+        return _solve_pbkdf2(challenge, password)
     if not allow_legacy:
         raise RuntimeError(
             "Box offered the legacy MD5 login (pre-FRITZ!OS 7.24). This weaker "
@@ -269,10 +259,31 @@ def solve_challenge(challenge: str, password: str, allow_legacy: bool = False) -
             "(or FRITZ_ALLOW_LEGACY=true) and prefer HTTPS so the exchange can't "
             "be observed."
         )
-    # Legacy: MD5 over (challenge + "-" + password) in UTF-16LE. The algorithm is
-    # mandated by the old FRITZ!Box protocol (the box computes the same MD5 and
-    # compares); it is not a password-at-rest hash and cannot be strengthened
-    # without breaking login on that firmware. Gated behind --allow-legacy-login.
+    return _solve_md5(challenge, password)
+
+
+def _solve_pbkdf2(challenge: str, password: str) -> str:
+    """Two-stage PBKDF2-HMAC-SHA256 for a ``2$<iter1>$<salt1>$<iter2>$<salt2>`` challenge."""
+    m = PBKDF2_CHALLENGE_RE.match(challenge)
+    if not m:
+        raise RuntimeError("Invalid PBKDF2 challenge format.")
+    it1, it2 = int(m.group("iter1")), int(m.group("iter2"))
+    if it1 > MAX_ITERATIONS or it2 > MAX_ITERATIONS:
+        raise RuntimeError(f"PBKDF2 iterations too high ({it1}/{it2}).")
+    salt1, salt2 = bytes.fromhex(m.group("salt1")), bytes.fromhex(m.group("salt2"))
+    hash1 = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt1, it1)
+    hash2 = hashlib.pbkdf2_hmac("sha256", hash1, salt2, it2)
+    return f"{m.group('salt2')}${hash2.hex()}"
+
+
+def _solve_md5(challenge: str, password: str) -> str:
+    """Legacy MD5 over (challenge + "-" + password) in UTF-16LE.
+
+    The algorithm is mandated by the old FRITZ!Box protocol (the box computes the
+    same MD5 and compares); it is not a password-at-rest hash and cannot be
+    strengthened without breaking login on that firmware. Gated behind
+    --allow-legacy-login by the caller.
+    """
     if not OLD_CHALLENGE_RE.fullmatch(challenge):
         raise RuntimeError("Invalid MD5 challenge format.")
     raw = f"{challenge}-{password}".encode("utf-16-le")
