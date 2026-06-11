@@ -79,6 +79,11 @@ You can also call the Python tool directly:
 ./fritzdump.py --iface 2-1 --to cap.pcap --redact    # headers only, no payload
 ```
 
+If you'd rather not keep the password in `.env`, pass `--password-file
+<path>` to read it from a local file instead (the file must be a regular,
+non-symlink file that is not readable by group/others). When neither `.env`
+nor `--password-file` provides a password, the tool prompts for it.
+
 ### Redacted capture (metadata only)
 
 Pass `--redact` (or set `FRITZ_REDACT=true` in `.env`) to record traffic
@@ -102,8 +107,13 @@ The defaults below are what a FRITZ!Box 6591 reports:
 
 - LAN bridge: `1-lan`
 - Wi-Fi 5 GHz: `4-133`
-- Wi-Fi 2.4 GHz: `4-135`
+- Wi-Fi 2.4 GHz: `1-ath0`
 - WAN (example): `2-1`
+
+For 2.4 GHz, `./run.sh home` captures the **raw radio** `1-ath0`, not the
+logical AP `4-135`: on this firmware `4-135` accepts the capture but streams
+zero packets, so 2.4 GHz-only devices would be silently missed. Override the
+whole set with `FRITZ_HOME_IFACES="lan:1-lan wifi_5ghz:4-133 wifi_24ghz:1-ath0"`.
 
 ## Dumps
 
