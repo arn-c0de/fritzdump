@@ -23,6 +23,8 @@ Notes:
   * Only capture your own network.
 """
 
+from __future__ import annotations
+
 import argparse
 import getpass
 import hashlib
@@ -41,6 +43,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Callable
 
 DEFAULT_HOST = "fritz.box"
 BASE_DIR = Path(__file__).resolve().parent
@@ -65,11 +68,11 @@ PBKDF2_CHALLENGE_RE = re.compile(
 OLD_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
 
 
-def load_dotenv(path=None):
+def load_dotenv(path: str | None = None) -> dict[str, str]:
     """Read a .env (KEY=VALUE) without exporting secrets to this process env."""
     if path is None:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    values = {}
+    values: dict[str, str] = {}
     if not os.path.exists(path):
         return values
     try:
@@ -89,6 +92,26 @@ def load_dotenv(path=None):
     return values
 
 
+class Settings:
+    """Reads configuration from the process environment first, then .env.
+
+    Secrets in the .env file are never exported into ``os.environ``; they are
+    only looked up on demand here, so they don't leak into child processes.
+    """
+
+    def __init__(self, dotenv: dict[str, str]):
+        self._dotenv = dotenv
+
+    def get(self, name: str, default: str | None = None) -> str | None:
+        return os.environ.get(name, self._dotenv.get(name, default))
+
+    def get_bool(self, name: str, default: bool = False) -> bool:
+        value = self.get(name)
+        if value is None:
+            return default
+        return value.lower() in ("1", "true", "yes")
+
+
 class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Prevent redirects to non-http(s) schemes like file:// or gopher://."""
 
@@ -99,7 +122,7 @@ class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def build_opener(scheme, insecure_tls=False, cacert=None):
+def build_opener(scheme: str, insecure_tls: bool = False, cacert: str | None = None):
     """urllib opener; HTTPS certificates are verified unless explicitly disabled.
 
     If ``cacert`` is given, it is used as the trust anchor instead of the system
@@ -125,25 +148,26 @@ def build_opener(scheme, insecure_tls=False, cacert=None):
     return urllib.request.build_opener(*handlers)
 
 
-def read_limited_text(resp, limit=MAX_TEXT_RESPONSE):
+def read_limited_text(resp, limit: int = MAX_TEXT_RESPONSE) -> str:
     data = resp.read(limit + 1)
     if len(data) > limit:
         raise RuntimeError(f"HTTP response too large (>{limit} bytes)")
     return data.decode("utf-8", "replace")
 
 
-def http_get(opener, url, binary=False, timeout=10, max_text=MAX_TEXT_RESPONSE):
+def http_get(opener, url: str, binary: bool = False, timeout: int | None = 10,
+             max_text: int = MAX_TEXT_RESPONSE):
     req = urllib.request.Request(url, headers={"User-Agent": "fritzcap/1.0"})
     resp = opener.open(req, timeout=timeout)
     return resp if binary else read_limited_text(resp, max_text)
 
 
-def validate_host(host):
+def validate_host(host: str) -> None:
     if not HOST_RE.fullmatch(host) or any(ch in host for ch in "/\\@?#"):
         raise ValueError("Invalid host. Use only a hostname or IP address.")
 
 
-def validate_capture_args(args):
+def validate_capture_args(args: argparse.Namespace) -> None:
     if args.iface and not IFACE_RE.fullmatch(args.iface):
         raise ValueError("Invalid interface ID.")
     if args.snaplen:
@@ -156,7 +180,7 @@ def validate_capture_args(args):
         )
 
 
-def read_password_file(path_text):
+def read_password_file(path_text: str) -> str:
     raw_path = Path(path_text).expanduser()
     if raw_path.is_symlink():
         raise ValueError("Password file must be a regular file, not a symlink.")
@@ -181,7 +205,7 @@ def read_password_file(path_text):
     return password
 
 
-def safe_capture_path(to):
+def safe_capture_path(to: str) -> Path:
     path = Path(to)
     allowed_roots = (BASE_DIR, DUMP_DIR.resolve(strict=False))
     if path.is_absolute():
@@ -206,7 +230,7 @@ def safe_capture_path(to):
     return resolved
 
 
-def get_challenge(opener, base):
+def get_challenge(opener, base: str) -> tuple[str, int]:
     """Fetch challenge + block time from login_sid.lua."""
     xml = http_get(opener, f"{base}/login_sid.lua?version=2")
     challenge = re.search(r"<Challenge>(.*?)</Challenge>", xml)
@@ -216,7 +240,7 @@ def get_challenge(opener, base):
     return challenge.group(1), int(blocktime.group(1)) if blocktime else 0
 
 
-def solve_challenge(challenge, password, allow_legacy=False):
+def solve_challenge(challenge: str, password: str, allow_legacy: bool = False) -> str:
     """Compute the login response. PBKDF2 for new, MD5 for old firmware.
 
     Modern FRITZ!OS (7.24+) sends a ``2$...`` PBKDF2 challenge and that path is
@@ -255,7 +279,7 @@ def solve_challenge(challenge, password, allow_legacy=False):
     return f"{challenge}-{hashlib.md5(raw).hexdigest()}"  # noqa: S324 - legacy protocol
 
 
-def get_sid(opener, base, user, response):
+def get_sid(opener, base: str, user: str, response: str) -> str:
     params = urllib.parse.urlencode({"username": user, "response": response})
     xml = http_get(opener, f"{base}/login_sid.lua?version=2&{params}")
     m = re.search(r"<SID>(.*?)</SID>", xml)
@@ -268,12 +292,12 @@ def get_sid(opener, base, user, response):
     return sid
 
 
-def sanitize_terminal(text):
+def sanitize_terminal(text: str) -> str:
     """Remove control characters and terminal escape sequences."""
     return "".join(ch for ch in text if ch.isprintable())
 
 
-def list_interfaces(opener, base, sid):
+def list_interfaces(opener, base: str, sid: str) -> None:
     """Parse the capture page response for interface IDs."""
     data = urllib.parse.urlencode({"sid": sid, "page": "cap", "lang": "en"}).encode()
     req = urllib.request.Request(f"{base}/data.lua", data=data,
@@ -508,7 +532,7 @@ class PcapRedactor:
         return min(ip_end, n)  # other protocols: keep the IP header only
 
 
-def open_target(to):
+def open_target(to: str):
     """Return (write_fn, flush_fn, close_fn, proc) depending on the target.
 
     flush_fn must be called after every write so a *consumer* tailing the target
@@ -542,31 +566,22 @@ def open_target(to):
     f = os.fdopen(fd, "wb")
     return f.write, f.flush, f.close, None
 
-def main():
-    dotenv = load_dotenv()
 
-    def cfg(name, default=None):
-        return os.environ.get(name, dotenv.get(name, default))
-
-    def cfg_bool(name, default=False):
-        val = cfg(name)
-        if val is None:
-            return default
-        return val.lower() in ("1", "true", "yes")
-
+def build_parser(settings: Settings) -> argparse.ArgumentParser:
+    """Build the CLI parser; defaults fall back to .env / environment values."""
     ap = argparse.ArgumentParser(description="Live capture from a FRITZ!Box")
-    ap.add_argument("--host", default=cfg("FRITZ_HOST", DEFAULT_HOST),
+    ap.add_argument("--host", default=settings.get("FRITZ_HOST", DEFAULT_HOST),
                     help="box host/IP (default from .env / fritz.box)")
     ap.add_argument("--https", action="store_true",
-                    default=cfg_bool("FRITZ_HTTPS"),
+                    default=settings.get_bool("FRITZ_HTTPS"),
                     help="use HTTPS instead of HTTP (or FRITZ_HTTPS=true in .env)")
     ap.add_argument("--https-insecure", action="store_true",
-                    default=cfg_bool("FRITZ_HTTPS_INSECURE"),
+                    default=settings.get_bool("FRITZ_HTTPS_INSECURE"),
                     help="disable HTTPS certificate verification (unsafe; prefer --cacert)")
-    ap.add_argument("--cacert", default=cfg("FRITZ_CACERT"),
+    ap.add_argument("--cacert", default=settings.get("FRITZ_CACERT"),
                     help="PEM file to verify the box's HTTPS cert against "
                          "(pin a self-signed cert); or FRITZ_CACERT in .env")
-    ap.add_argument("--user", default=cfg("FRITZ_USER"),
+    ap.add_argument("--user", default=settings.get("FRITZ_USER"),
                     help="FRITZ!Box user (or dslf-config); else FRITZ_USER from .env")
     ap.add_argument("--password-file",
                     help="read password from a local file instead of .env/prompt")
@@ -577,26 +592,29 @@ def main():
                     help="target: wireshark | ntopng | <file.pcap> | - (stdout)")
     ap.add_argument("--list", action="store_true", help="only list interfaces")
     ap.add_argument("--redact", action="store_true",
-                    default=cfg_bool("FRITZ_REDACT"),
+                    default=settings.get_bool("FRITZ_REDACT"),
                     help="strip packet payloads, keep only headers (who/where/"
                          "size, not content); or FRITZ_REDACT=true in .env")
     ap.add_argument("--allow-legacy-login", action="store_true",
-                    default=cfg_bool("FRITZ_ALLOW_LEGACY"),
+                    default=settings.get_bool("FRITZ_ALLOW_LEGACY"),
                     help="permit the weak pre-7.24 MD5 login (refused by default "
                          "to block downgrades); or FRITZ_ALLOW_LEGACY=true in .env")
-    args = ap.parse_args()
+    return ap
 
-    if not args.user:
-        sys.exit("No user. Set FRITZ_USER in .env or use --user.")
 
-    try:
-        validate_host(args.host)
-        validate_capture_args(args)
-    except ValueError as exc:
-        sys.exit(f"ERROR: {exc}")
+def resolve_password(args: argparse.Namespace, settings: Settings) -> str:
+    """Get the password from --password-file, then .env, then an interactive prompt."""
+    if args.password_file:
+        try:
+            return read_password_file(args.password_file)
+        except ValueError as exc:
+            sys.exit(f"ERROR: {exc}")
+    return settings.get("FRITZ_PW") or getpass.getpass("FRITZ!Box password: ")
 
+
+def prepare_transport(args: argparse.Namespace) -> str:
+    """Validate the transport options and return the base URL for the box."""
     scheme = "https" if args.https else "http"
-    base = f"{scheme}://{args.host}"
     if scheme == "http":
         print(
             "WARNING: using plain HTTP. Your session token and ALL captured "
@@ -611,35 +629,30 @@ def main():
             sys.exit("ERROR: --cacert requires --https (or FRITZ_HTTPS=true).")
         if not os.path.isfile(args.cacert):
             sys.exit(f"ERROR: CA cert file not found: {args.cacert}")
-    if args.password_file:
-        try:
-            password = read_password_file(args.password_file)
-        except ValueError as exc:
-            sys.exit(f"ERROR: {exc}")
-    else:
-        password = cfg("FRITZ_PW") or getpass.getpass("FRITZ!Box password: ")
-    opener = build_opener(scheme, args.https_insecure, args.cacert)
+    return f"{scheme}://{args.host}"
 
+
+def login(opener, base: str, user: str, password: str, allow_legacy: bool) -> str:
+    """Run the full challenge/response handshake and return the session ID."""
     challenge, blocktime = get_challenge(opener, base)
     if blocktime:
         print(f"Note: box reports BlockTime {blocktime}s (too many failed logins).",
               file=sys.stderr)
-    sid = get_sid(opener, base, args.user,
-                  solve_challenge(challenge, password, args.allow_legacy_login))
-    print("Login ok.", file=sys.stderr)
+    response = solve_challenge(challenge, password, allow_legacy)
+    return get_sid(opener, base, user, response)
 
-    if args.list:
-        list_interfaces(opener, base, sid)
-        return
 
-    if not args.iface:
-        sys.exit("Please provide --iface (or run --list first).")
+def run_capture(opener, base: str, sid: str, args: argparse.Namespace) -> bool:
+    """Stream the live capture to the chosen target until stopped.
 
-    q = urllib.parse.urlencode({
+    Returns True if the capture ended with an error (so the caller can exit
+    with a non-zero status), False on a clean stop.
+    """
+    start_query = urllib.parse.urlencode({
         "ifaceorminor": args.iface, "snaplen": args.snaplen,
         "filter": args.filter, "capture": "Start", "sid": sid,
     })
-    cap_url = f"{base}/cgi-bin/capture_notimeout?{q}"
+    cap_url = f"{base}/cgi-bin/capture_notimeout?{start_query}"
     stop_url = f"{base}/cgi-bin/capture_notimeout?capture=Stop&sid={sid}&ifaceorminor={args.iface}"
 
     write, flush, close, proc = open_target(args.to)
@@ -647,21 +660,22 @@ def main():
         write = PcapRedactor(write).feed
         print("[*] Redaction ON: payloads stripped; only packet headers "
               "(addresses, ports, sizes) are recorded.", file=sys.stderr)
-    shutdown_requested = False
+
+    stop_requested = False
     capture_error = None
 
-    def signal_handler(*_):
-        nonlocal shutdown_requested
-        shutdown_requested = True
+    def request_stop(*_):
+        nonlocal stop_requested
+        stop_requested = True
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
 
     print(f"Capture running on {args.iface} -> {args.to}. Stop with Ctrl-C.",
           file=sys.stderr)
     try:
         resp = http_get(opener, cap_url, binary=True, timeout=None)
-        while not shutdown_requested:
+        while not stop_requested:
             # read1() hands back whatever one socket/chunk read yields instead of
             # blocking until a full 65 KB has accumulated — on a low-rate link that
             # accumulation is exactly what made the capture arrive in bursts. Pair
@@ -678,22 +692,50 @@ def main():
         msg = re.sub(r"sid=[0-9a-f]{16,64}", "sid=***HIDDEN***", str(exc))
         print(f"\nERROR: {msg}", file=sys.stderr)
     finally:
-        if not shutdown_requested:
+        if not stop_requested:
             print("\n[*] Stopping capture...", file=sys.stderr)
-        try:
-            http_get(opener, stop_url, binary=True, timeout=5).read(1024)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            close()
-        except Exception:  # noqa: BLE001
-            pass
+        _quietly(lambda: http_get(opener, stop_url, binary=True, timeout=5).read(1024))
+        _quietly(close)
         if proc:
-            try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
-    if capture_error:
+            _quietly(proc.terminate)
+    return capture_error is not None
+
+
+def _quietly(action: Callable[[], object]) -> None:
+    """Run a best-effort cleanup action, ignoring any error it raises."""
+    try:
+        action()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def main() -> None:
+    settings = Settings(load_dotenv())
+    args = build_parser(settings).parse_args()
+
+    if not args.user:
+        sys.exit("No user. Set FRITZ_USER in .env or use --user.")
+    try:
+        validate_host(args.host)
+        validate_capture_args(args)
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
+
+    base = prepare_transport(args)
+    password = resolve_password(args, settings)
+    opener = build_opener("https" if args.https else "http",
+                          args.https_insecure, args.cacert)
+
+    sid = login(opener, base, args.user, password, args.allow_legacy_login)
+    print("Login ok.", file=sys.stderr)
+
+    if args.list:
+        list_interfaces(opener, base, sid)
+        return
+    if not args.iface:
+        sys.exit("Please provide --iface (or run --list first).")
+
+    if run_capture(opener, base, sid, args):
         sys.exit(1)
 
 
