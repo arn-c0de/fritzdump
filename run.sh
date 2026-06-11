@@ -25,6 +25,19 @@ PROJECT_DIR="$(pwd -P)"
 EXPECTED_DUMP_ROOT="$PROJECT_DIR/dumps"
 DUMP_ROOT="${DUMP_ROOT:-$EXPECTED_DUMP_ROOT}"
 
+# Abort with a helpful hint if no interface was given. $1 is an example ID.
+require_iface() {
+  if [[ -z "$IFACE" ]]; then
+    echo "Interface missing, e.g.: ./run.sh $MODE ${1:-2-1}" >&2
+    exit 1
+  fi
+}
+
+# Abort if an external tool we want to pipe into is not installed.
+require_tool() {
+  command -v "$1" >/dev/null || { echo "$1 not installed" >&2; exit 1; }
+}
+
 prepare_dump_root() {
   if [[ -z "$DUMP_ROOT" || "$DUMP_ROOT" == "/" || "$DUMP_ROOT" == "." ]]; then
     echo "ERROR: refusing unsafe DUMP_ROOT: ${DUMP_ROOT:-<empty>}" >&2
@@ -78,14 +91,13 @@ capture_group() {
   # on this firmware 4-135 accepts the capture but streams ZERO packets, while
   # the actual 2.4 GHz client traffic (e.g. phones that only roam onto 2.4 GHz)
   # shows up on 1-ath0. Capturing 4-135 silently lost every 2.4 GHz-only device.
-  local -a names=() ifaces=()
-  local _pairs="${FRITZ_HOME_IFACES:-lan:1-lan wifi_5ghz:4-133 wifi_24ghz:1-ath0}"
-  local _p
-  for _p in $_pairs; do
-    names+=("${_p%%:*}")
-    ifaces+=("${_p#*:}")
+  local -a names=() ifaces=() pids=()
+  local default_ifaces="lan:1-lan wifi_5ghz:4-133 wifi_24ghz:1-ath0"
+  local pair
+  for pair in ${FRITZ_HOME_IFACES:-$default_ifaces}; do
+    names+=("${pair%%:*}")    # text before the ':' is the file-name label
+    ifaces+=("${pair#*:}")    # text after the ':' is the FRITZ!OS interface ID
   done
-  local -a pids=()
 
   echo "[*] Capturing LAN + Wi-Fi 5 GHz + Wi-Fi 2.4 GHz into $outdir/"
   echo "[*] Stop with Ctrl-C."
@@ -123,17 +135,17 @@ case "$MODE" in
     exec "$PY" fritzdump.py --list
     ;;
   wireshark)
-    [[ -z "$IFACE" ]] && { echo "Interface missing, e.g.: ./run.sh wireshark 2-1" >&2; exit 1; }
-    command -v wireshark >/dev/null || { echo "wireshark not installed" >&2; exit 1; }
+    require_iface 2-1
+    require_tool wireshark
     exec "$PY" fritzdump.py --iface "$IFACE" --to wireshark
     ;;
   ntopng)
-    [[ -z "$IFACE" ]] && { echo "Interface missing, e.g.: ./run.sh ntopng 1-0" >&2; exit 1; }
-    command -v ntopng >/dev/null || { echo "ntopng not installed" >&2; exit 1; }
+    require_iface 1-0
+    require_tool ntopng
     exec "$PY" fritzdump.py --iface "$IFACE" --to ntopng
     ;;
   file)
-    [[ -z "$IFACE" ]] && { echo "Interface missing, e.g.: ./run.sh file 2-1" >&2; exit 1; }
+    require_iface 2-1
     prepare_dump_root
     OUT="$(mktemp -p "$DUMP_ROOT" "dump_$(date +%Y%m%d_%H%M%S)_XXXXXX.pcap")"
     echo "[*] Writing to $OUT (Ctrl-C stops) ..."
@@ -143,7 +155,7 @@ case "$MODE" in
     capture_group
     ;;
   raw)
-    [[ -z "$IFACE" ]] && { echo "Interface missing, e.g.: ./run.sh raw 2-1" >&2; exit 1; }
+    require_iface 2-1
     exec "$PY" fritzdump.py --iface "$IFACE" --to -
     ;;
   *)
