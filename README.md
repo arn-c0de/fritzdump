@@ -121,6 +121,15 @@ Captures are written to `./dumps/`. When a new default capture starts, old
 `dump_*` folders are removed first. The `dumps/` folder and all `*.pcap`,
 `*.pcapng`, and `*.eth` files are git-ignored.
 
+## Development
+
+The login challenge math, input validation, interface parsing and the pcap
+redactor are covered by unit tests (standard library only, no box needed):
+
+```bash
+python3 -m unittest discover -s tests
+```
+
 ## Security notes
 
 - Only capture traffic on networks you own or are explicitly authorized to inspect.
